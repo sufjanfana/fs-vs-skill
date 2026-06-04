@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""sql-skill: run a SQL query, materialize results, emit operator metrics.
+
+Reads SQL from argv[1]. Connects via PG_CONNECTION_STRING. Returns inline
+JSON for small results (<= 28 KB); otherwise writes result_N.ndjson and
+returns a navigation summary {row_count, file_path, byte_size, columns,
+distinct (per-column ≤200 values), first_row (strings truncated 200 chars)}.
+Appends one JSONL line per call to .sql_metrics.jsonl for operator metrics.
+
+Spill dir and sidecar path are env-pinned (ARMB_SPILL_DIR, ARMB_SIDECAR_PATH);
+unset falls back to cwd. Statement timeout honors STMT_TIMEOUT_MS env (default
+30000), connect timeout 5s.
+
+Exit codes: 0 success, 1 SQL/runtime error, 2 invalid invocation.
+"""
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import psycopg2
+import psycopg2.extras
+
+# Inline up to this size; ~2 KB headroom under the SDK Bash persisted-output
+# cliff so a tool result never trips inline-truncate + persist.
+INLINE_THRESHOLD_BYTES = 28 * 1024
+STATEMENT_TIMEOUT_MS = int(os.environ.get("STMT_TIMEOUT_MS", "30000"))
+CONNECT_TIMEOUT_S = 5
+SIDECAR_NAME = ".sql_metrics.jsonl"
+# Harness-pinned absolute paths so agent cwd drift (`cd /tmp && /abs/sql ...`)
+# doesn't orphan metrics or spills. Unset falls back to cwd-relative.
+SIDECAR_PATH_ENV = "ARMB_SIDECAR_PATH"
+SPILL_DIR_ENV = "ARMB_SPILL_DIR"
+
+# Spill-mode navigation summary: lets the agent pick a target row without a
+# preview round-trip on the spill file. Cardinality limit keeps `distinct`
+# useful (i.e. genuinely picking from a short list) and bounded in size;
+# byte cap keeps the summary under the inline threshold and well under the
+# SDK persisted-output cliff; field truncation keeps first_row legible
+# without flooding the response with one giant content blob.
+DISTINCT_CARDINALITY_LIMIT = 200
+SUMMARY_CAP_BYTES = 8 * 1024
+FIRST_ROW_STR_TRUNC = 200
+
+
+def next_result_index(cwd: Path) -> int:
+    existing = []
+    for entry in cwd.iterdir():
+        m = re.match(r"^result_(\d+)\.ndjson$", entry.name)
+        if m:
+            existing.append(int(m.group(1)))
+    return (max(existing) if existing else 0) + 1
+
+
+def _truncate_first_row(row: dict) -> dict:
+    """Copy of `row` with string fields truncated to FIRST_ROW_STR_TRUNC chars.
+
+    Truncated strings get a trailing ellipsis marker so the agent does not
+    mistake the truncated content for the full content.
+    """
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, str) and len(v) > FIRST_ROW_STR_TRUNC:
+            out[k] = v[:FIRST_ROW_STR_TRUNC] + "…"
+        else:
+            out[k] = v
+    return out
+
+
+def _build_distinct_map(rows: list, columns: list) -> dict:
+    """Return {column: sorted_distinct_values} for columns with ≤ LIMIT distinct values.
+
+    Unhashable column values (dicts, lists from JSONB) disqualify the column
+    — they cannot be set members and `distinct` for a column whose values
+    are JSON objects is rarely the navigation index the agent wants anyway.
+    """
+    per_col: dict = {c: set() for c in columns}
+    over: set = set()
+    for row in rows:
+        for col in columns:
+            if col in over:
+                continue
+            try:
+                per_col[col].add(row.get(col))
+                if len(per_col[col]) > DISTINCT_CARDINALITY_LIMIT:
+                    over.add(col)
+            except TypeError:
+                over.add(col)
+    out: dict = {}
+    for col in columns:
+        if col in over:
+            continue
+        # Stable ordering: None last, then string-sort. Helps the agent skim.
+        out[col] = sorted(per_col[col], key=lambda x: (x is None, str(x)))
+    return out
+
+
+def build_spill_summary(rows: list, file_path: str, row_count: int, byte_size: int) -> dict:
+    """Build the inline navigation summary for a spilled result.
+
+    Always populates: row_count, file_path, byte_size, columns.
+    Best-effort: first_row (truncated), distinct (low-cardinality columns).
+    Caps total serialized size at SUMMARY_CAP_BYTES by dropping the
+    highest-cardinality distinct columns first, then distinct entirely,
+    then first_row.
+    """
+    columns = list(rows[0].keys()) if rows else []
+    summary: dict = {
+        "row_count": row_count,
+        "file_path": file_path,
+        "byte_size": byte_size,
+        "columns": columns,
+    }
+    if rows:
+        summary["first_row"] = _truncate_first_row(rows[0])
+        summary["distinct"] = _build_distinct_map(rows, columns)
+
+    def size(obj: dict) -> int:
+        return len(json.dumps(obj, default=str).encode("utf-8"))
+
+    if size(summary) <= SUMMARY_CAP_BYTES:
+        return summary
+
+    # Drop largest-cardinality distinct columns until under cap.
+    distinct = summary.get("distinct", {})
+    if distinct:
+        by_card = sorted(distinct.items(), key=lambda kv: -len(kv[1]))
+        for col, _ in by_card:
+            del distinct[col]
+            if size(summary) <= SUMMARY_CAP_BYTES:
+                return summary
+
+    summary.pop("distinct", None)
+    if size(summary) <= SUMMARY_CAP_BYTES:
+        return summary
+
+    summary.pop("first_row", None)
+    return summary
+
+
+def resolve_sidecar_path(cwd: Path) -> Path:
+    """Return the absolute path where this invocation should append its sidecar.
+
+    Honors `ARMB_SIDECAR_PATH` when set (harness-pinned absolute path); falls
+    back to `<cwd>/.sql_metrics.jsonl` for manual-testing workflows.
+    """
+    env_path = os.environ.get(SIDECAR_PATH_ENV)
+    if env_path:
+        return Path(env_path)
+    return cwd / SIDECAR_NAME
+
+
+def resolve_spill_dir(cwd: Path) -> Path:
+    """Return the directory where spill files should land.
+
+    Honors `ARMB_SPILL_DIR` when set; falls back to cwd.
+    """
+    env_path = os.environ.get(SPILL_DIR_ENV)
+    if env_path:
+        return Path(env_path)
+    return cwd
+
+
+def append_sidecar(cwd: Path, payload: dict) -> None:
+    target = resolve_sidecar_path(cwd)
+    try:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as exc:
+        # Best-effort; never block the script on telemetry failure. Surface
+        # the reason so the stitch warning's "sidecar exhausted" has a
+        # breadcrumb in stderr.
+        print(f"warn: sidecar append failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: sql 'SELECT ...'", file=sys.stderr)
+        return 2
+    query = sys.argv[1]
+    dsn = os.environ.get("PG_CONNECTION_STRING")
+    if not dsn:
+        print("error: PG_CONNECTION_STRING is not set", file=sys.stderr)
+        return 2
+    cwd = Path.cwd()
+    t_start_ms = int(time.time() * 1000)
+    db_ms = 0
+    row_count = 0
+    mode = "inline"
+    result_path = None
+    error_msg = None
+
+    try:
+        # statement_timeout is set as a libpq startup parameter (DSN options=)
+        # rather than via `SET statement_timeout = ...` so the timeout applies
+        # regardless of autocommit / transaction state. A future
+        # `conn.autocommit = True` would NOT silently disable the timeout.
+        conn = psycopg2.connect(
+            dsn,
+            connect_timeout=CONNECT_TIMEOUT_S,
+            options=f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+        )
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Role enforcement: docs_ro Postgres grants are the runtime
+                # contract (no per-call re-check, no SQL allowlist). The
+                # batch-start smoke gate verifies the role via INSERT→42501;
+                # any future write capability MUST update that gate.
+                t_db_start = time.time()
+                cur.execute(query)
+                rows = cur.fetchall() if cur.description else []
+                db_ms = int((time.time() - t_db_start) * 1000)
+
+            rows_dicts = [dict(r) for r in rows]
+            row_count = len(rows_dicts)
+            inline_payload = json.dumps({"row_count": row_count, "rows": rows_dicts}, default=str)
+
+            if len(inline_payload.encode("utf-8")) <= INLINE_THRESHOLD_BYTES:
+                sys.stdout.write(inline_payload + "\n")
+            else:
+                mode = "spill"
+                spill_dir = resolve_spill_dir(cwd)
+                idx = next_result_index(spill_dir)
+                fname = f"result_{idx}.ndjson"
+                fpath = spill_dir / fname
+                tmp = spill_dir / (fname + ".tmp")
+                body = "".join(json.dumps(r, default=str) + "\n" for r in rows_dicts)
+                body_bytes = body.encode("utf-8")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(body)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, fpath)
+                # Absolute when pinned outside cwd so the agent's `jq` works from any cwd.
+                result_path = f"./{fname}" if spill_dir == cwd else str(fpath)
+                summary = build_spill_summary(
+                    rows_dicts, result_path, row_count, len(body_bytes)
+                )
+                sys.stdout.write(json.dumps(summary, default=str) + "\n")
+        finally:
+            conn.close()
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        print(error_msg, file=sys.stderr)
+        return 1
+    finally:
+        t_end_ms = int(time.time() * 1000)
+        payload = {
+            "t_start_ms": t_start_ms,
+            "t_end_ms": t_end_ms,
+            "db_ms": db_ms,
+            "row_count": row_count,
+            "mode": mode,
+            "result_path": result_path,
+        }
+        if error_msg:
+            payload["error"] = error_msg
+        append_sidecar(cwd, payload)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
