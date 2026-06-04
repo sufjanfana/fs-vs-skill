@@ -83,7 +83,7 @@ judge (`src/shared/config.ts`).
 
 Each arm is built to perform to its architectural limit — neither is strawmanned. Arm A
 gets the faithful ChromaFs instantiation (real `just-bash`, the full filter set, prefetch
-+ per-run cache); Arm B gets the canonical skill bundle with a navigation summary that
+and per-run cache); Arm B gets the canonical skill bundle with a navigation summary that
 removes the substrate-handoff round-trip.
 
 Both orientations — Arm A's `orientation.md` and Arm B's `SKILL.md` — are written as
